@@ -1,3 +1,13 @@
+"""图文 PDF RAG 示例。
+
+主流程：
+1. 用 PyMuPDF4LLM 提取页面 Markdown，并导出图片文件。
+2. 用 PyMuPDF 补充图片页码和 bbox 坐标。
+3. 把正文和图片描述统一构建为 Chunk。
+4. 用关键词检索召回正文和图片。
+5. 有图片命中时，把原图一起发送给视觉模型回答。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -17,6 +27,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 
+# 默认使用阿里百炼 OpenAI 兼容接口。
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_TEXT_MODEL = "qwen-plus"
 DEFAULT_VISION_MODEL = "qwen-vl-max"
@@ -24,11 +35,14 @@ DEFAULT_VISION_MODEL = "qwen-vl-max"
 
 @dataclass
 class Chunk:
+    """统一表示正文块和图片块。"""
+
     chunk_id: str
     source: str
     page: int
     text: str
     terms: list[str]
+    # kind 为 text 时使用 text 检索；kind 为 image 时再用 image_path 发起多模态问答。
     kind: str = "text"
     image_path: str | None = None
     image_bbox: tuple[float, float, float, float] | None = None
@@ -47,6 +61,8 @@ def extract_terms(text: str) -> list[str]:
     """提取中文二元词组、中文字符、英文单词和数字编码。"""
     text = text.lower()
     terms: list[str] = []
+
+    # 英文单词、型号、错误码、版本号等按完整 token 保留。
     terms.extend(
         re.findall(
             r"[a-z0-9]+(?:[-_/\.][a-z0-9]+)*",
@@ -54,6 +70,7 @@ def extract_terms(text: str) -> list[str]:
         )
     )
 
+    # 中文使用二元词组，兼顾中文分词效果和实现复杂度。
     for sequence in re.findall(r"[\u4e00-\u9fff]+", text):
         if len(sequence) <= 2:
             terms.extend(sequence)
@@ -85,6 +102,7 @@ def split_text(
     chunks: list[str] = []
     current = ""
 
+    # 先按 Markdown 空行切段落，尽量保持语义完整。
     for paragraph in paragraphs:
         candidate = (
             f"{current}\n\n{paragraph}".strip()
@@ -103,6 +121,7 @@ def split_text(
             current = paragraph
             continue
 
+        # 单个段落仍然过长时，退化为带 overlap 的字符窗口。
         start = 0
 
         while start < len(paragraph):
@@ -130,6 +149,7 @@ def extract_pdf_pages(pdf_path: str, image_dir: str) -> list[dict]:
     image_dir_path = Path(image_dir)
     image_dir_path.mkdir(parents=True, exist_ok=True)
 
+    # page_chunks=True 保留页码边界；write_images=True 会导出图片并写入 Markdown 占位符。
     pages = pymupdf4llm.to_markdown(
         pdf_path,
         page_chunks=True,
@@ -140,12 +160,14 @@ def extract_pdf_pages(pdf_path: str, image_dir: str) -> list[dict]:
         table_strategy="lines_strict",
     )
 
+    # 匹配 Markdown 图片占位符，例如 ![](demo.pdf.images/demo.pdf-0001-01.png)。
     image_pattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
     result: list[dict] = []
 
     with pymupdf.open(pdf_path) as document:
         for index, page_data in enumerate(pages, start=1):
             metadata = page_data.get("metadata", {})
+            # 优先使用 PyMuPDF4LLM 返回的真实页码，缺失时再回退到遍历下标。
             page_number = int(
                 metadata.get("page")
                 or metadata.get("page_number")
@@ -153,8 +175,10 @@ def extract_pdf_pages(pdf_path: str, image_dir: str) -> list[dict]:
             )
             page_text = page_data.get("text", "")
             image_references = image_pattern.findall(page_text)
+            # 图片路径已经单独保存，正文索引中不应继续保留 Markdown 占位符。
             page_text = normalize_text(image_pattern.sub("", page_text))
 
+            # PyMuPDF 提供图片在页面中的展示坐标，后续可用于高亮或裁剪。
             image_infos = document[page_number - 1].get_image_info(
                 xrefs=True
             )
@@ -171,6 +195,7 @@ def extract_pdf_pages(pdf_path: str, image_dir: str) -> list[dict]:
                     if image_index < len(image_infos)
                     else {}
                 )
+                # 某些 PDF 的图片信息不完整，缺失坐标时使用零矩形兜底。
                 bbox = image_info.get(
                     "bbox",
                     (0.0, 0.0, 0.0, 0.0),
@@ -209,6 +234,7 @@ def build_chunks(
     for page_data in pages:
         page_number = page_data["page"]
 
+        # 正文块只负责文本检索。
         for chunk_index, text in enumerate(
             split_text(page_data["text"])
         ):
@@ -223,10 +249,12 @@ def build_chunks(
                 )
             )
 
+        # 图片块同时承载“可检索描述”和“原始图片路径”。
         for image_index, image in enumerate(page_data["images"]):
             image_path = image["path"]
             if image_captioner:
                 try:
+                    # 视觉描述只是召回辅助信息，失败不能中断整个 PDF 的索引。
                     caption = image_captioner(
                         image_path,
                         page_number,
@@ -238,11 +266,13 @@ def build_chunks(
                     )
                     caption = f"第 {page_number} 页图片"
             else:
+                # 离线模式或未配置视觉模型时，保留基础图片索引。
                 caption = f"第 {page_number} 页图片"
 
             caption = normalize_text(caption) or (
                 f"第 {page_number} 页图片"
             )
+            # 把图片描述、页码和文件名放在同一个 chunk 中，便于关键词检索。
             searchable_text = normalize_text(
                 f"{caption}\n"
                 f"图片来源：第 {page_number} 页 "
@@ -266,6 +296,7 @@ def build_chunks(
 
 
 def save_chunks(chunks: list[Chunk], output_path: str) -> None:
+    """把 Chunk 列表序列化为 UTF-8 JSON 缓存。"""
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(
@@ -279,6 +310,7 @@ def save_chunks(chunks: list[Chunk], output_path: str) -> None:
 
 
 def load_chunks(input_path: str) -> list[Chunk]:
+    """从 JSON 缓存恢复 Chunk，并兼容列表形式的 bbox。"""
     data = json.loads(
         Path(input_path).read_text(encoding="utf-8")
     )
@@ -293,6 +325,7 @@ def load_chunks(input_path: str) -> list[Chunk]:
 
 
 def is_image_question(query: str) -> bool:
+    """粗略判断用户问题是否存在图片意图，用于给图片块加权。"""
     normalized = query.lower()
     markers = (
         "图片",
@@ -322,6 +355,7 @@ class KeywordRetriever:
 
     def __init__(self, chunks: list[Chunk]):
         self.chunks = chunks
+        # 记录词项出现在多少个 chunk 中，供 IDF 计算使用。
         self.document_frequency: dict[str, int] = {}
 
         for chunk in chunks:
@@ -331,6 +365,7 @@ class KeywordRetriever:
                 )
 
     def _idf(self, term: str) -> float:
+        """越少见的词项权重越高，避免“的、是、页”等词影响排序。"""
         document_count = len(self.chunks)
         frequency = self.document_frequency.get(term, 0)
         return math.log(
@@ -349,6 +384,7 @@ class KeywordRetriever:
             return 0.0
 
         matched_terms = query_term_set & set(chunk.terms)
+        # coverage 表示查询词在 chunk 中被覆盖的比例。
         weighted_overlap = sum(
             self._idf(term) for term in matched_terms
         )
@@ -365,9 +401,11 @@ class KeywordRetriever:
         normalized_text = chunk.text.lower()
         exact_bonus = 0.0
 
+        # 完整查询串直接命中时，通常比零散词项命中更相关。
         if normalized_query and normalized_query in normalized_text:
             exact_bonus += 3.0
 
+        # 型号、错误码、版本号等英文数字 token 单独加权。
         for code in set(
             re.findall(
                 r"[a-z0-9]+(?:[-_/\.][a-z0-9]+)*",
@@ -377,6 +415,7 @@ class KeywordRetriever:
             if code in normalized_text:
                 exact_bonus += 2.0
 
+        # 长文本偶然命中更多词，做轻微长度惩罚；图片问题则额外给图片块加权。
         length_penalty = min(len(chunk.text) / 1000, 2.0)
         image_intent_bonus = (
             4.0
@@ -410,6 +449,7 @@ class KeywordRetriever:
             if score >= min_score:
                 scored.append((score, chunk))
 
+        # 分数相同时保持原始插入顺序，便于文本块和图片块稳定输出。
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[:top_k]
 
@@ -448,6 +488,7 @@ def format_context(
 
 
 def image_to_data_url(image_path: str) -> str:
+    """把本地图片编码为 OpenAI Chat Completions 可接收的 Data URL。"""
     path = Path(image_path)
     mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -460,6 +501,7 @@ def describe_image(
     image_path: str,
     page: int,
 ) -> str:
+    """调用视觉模型生成图片描述，用于建立图片关键词索引。"""
     response = client.chat.completions.create(
         model=model,
         temperature=0,
@@ -474,6 +516,7 @@ def describe_image(
             },
             {
                 "role": "user",
+                # 多模态消息由文本提示和 image_url 图片项组成。
                 "content": [
                     {
                         "type": "text",
@@ -500,6 +543,7 @@ def build_vision_user_content(
     question: str,
     results: list[tuple[float, Chunk]],
 ) -> list[dict]:
+    """构造包含文本资料和原始图片的多模态用户消息。"""
     context = format_context(results)
     content: list[dict] = [
         {
@@ -512,6 +556,7 @@ def build_vision_user_content(
             ),
         }
     ]
+    # 同一张图片可能被多个检索结果引用，上传前去重。
     seen_images: set[str] = set()
 
     for _score, chunk in results:
@@ -540,6 +585,7 @@ def build_vision_user_content(
 
 
 def create_client() -> tuple[OpenAI, str, str]:
+    """从 .env 读取百炼配置，并返回文本模型和视觉模型配置。"""
     load_dotenv()
     api_key = os.getenv("DASHSCOPE_API_KEY")
     base_url = os.getenv("DASHSCOPE_BASE_URL", DEFAULT_BASE_URL)
@@ -581,7 +627,9 @@ def ask_qwen(
     question: str,
     results: list[tuple[float, Chunk]],
 ) -> str:
+    """优先使用视觉模型回答图片问题，失败时降级为纯文本回答。"""
     client, text_model, vision_model = create_client()
+    # 约束模型只依据检索资料回答，并强制输出页码引用。
     system_prompt = (
         "你是一个严谨的中文 PDF 文档问答助手。\n\n"
         "回答要求：\n"
@@ -593,6 +641,7 @@ def ask_qwen(
         "6. 如果图片包含答案，要明确说明是从图片中识别到的。"
     )
     context = format_context(results)
+    # 只有本地图片文件仍然存在时，才向视觉模型上传原图。
     has_image = any(
         chunk.kind == "image"
         and chunk.image_path
@@ -614,10 +663,12 @@ def ask_qwen(
             )
             return message_text(response.choices[0].message)
         except Exception as exc:
+            # 视觉模型不可用时，继续使用已经生成的图片描述回答。
             print(
                 f"视觉模型调用失败，将仅使用图片描述回答：{exc}"
             )
 
+    # 无图片或视觉模型失败时，退回到纯文本模型。
     response = client.chat.completions.create(
         model=text_model,
         temperature=0,
@@ -660,6 +711,7 @@ def cache_is_usable(
     cache_path: str,
     image_dir: str,
 ) -> bool:
+    """检查缓存是否比 PDF 新，并且缓存引用的图片文件仍然存在。"""
     pdf_file = Path(pdf_path)
     cache_file = Path(cache_path)
 
@@ -677,6 +729,7 @@ def cache_is_usable(
     image_chunks = [
         chunk for chunk in chunks if chunk.kind == "image"
     ]
+    # 图片目录被删除或移动后，旧缓存不能继续使用。
     if image_chunks and not Path(image_dir).is_dir():
         return False
 
@@ -694,6 +747,7 @@ def build_or_load_index(
     caption_images: bool = True,
     image_captioner: Callable[[str, int], str] | None = None,
 ) -> list[Chunk]:
+    """优先读取可用缓存，否则重新解析 PDF 并建立图文索引。"""
     pdf_file = Path(pdf_path)
     cache_file = Path(cache_path)
     image_dir = image_dir or f"{pdf_path}.images"
@@ -714,6 +768,7 @@ def build_or_load_index(
 
     if caption_images and resolved_captioner is None:
         try:
+            # 默认在索引阶段调用视觉模型生成图片描述。
             client, _text_model, vision_model = create_client()
 
             def resolved_captioner(
@@ -730,6 +785,7 @@ def build_or_load_index(
         except RuntimeError as exc:
             print(f"未生成图片描述，将使用基础图片索引：{exc}")
 
+    # 记录图片描述失败次数，避免把不完整索引写入长期缓存。
     caption_failures = [0]
 
     if caption_images and resolved_captioner is not None:
@@ -756,6 +812,7 @@ def build_or_load_index(
     captioning_unavailable = (
         caption_images and resolved_captioner is None
     )
+    # 显式关闭描述，或图片描述全部成功时，才允许写缓存。
     should_cache = (
         not caption_images
         or image_count == 0
@@ -781,6 +838,7 @@ def build_or_load_index(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
         description="使用 PyMuPDF4LLM、PyMuPDF 和 Qwen 实现图文 PDF RAG"
     )
@@ -820,6 +878,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI 入口：建立索引并进入交互式问答。"""
     args = parse_args(argv)
     pdf_path = args.pdf_path
 
