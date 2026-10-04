@@ -1,0 +1,3 @@
+DASHSCOPE_API_KEY=sk-dfsfsdfghhdfgdfgdfg
+DASHSCOPE_MODEL=qwen3.7-flash-2026-07-15
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1

@@ -1,0 +1,12 @@
+[project]
+name = "pymupdfrag"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "langchain>=1.4.3",
+    "langchain-text-splitters>=1.1.2",
+    "openai>=3.20.0",
+    "pymupdf>=1.28.2",
+    "pymupdf4llm>=1.28.2",
+    "python-dotenv>=1.2.3",
+]
